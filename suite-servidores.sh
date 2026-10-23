@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Suíte Gerbit v3.1: assistente interativo de manutenção.
+# Suíte Gerbit v3.2: assistente interativo de manutenção.
 set -Eeuo pipefail
 export LC_ALL=C
 main() {
@@ -322,7 +322,7 @@ screen_header() {
  if [[ -t 0 && ${TERM:-dumb} != dumb && -w /dev/tty ]]; then
   printf '\033[2J\033[H' > /dev/tty
  fi
- printf '\nGERBIT — ASSISTENTE DE MANUTENÇÃO v3.1\n%s\n\n' "$1"
+ printf '\nGERBIT — ASSISTENTE DE MANUTENÇÃO v3.2\n%s\n\n' "$1"
 }
 pause_screen() {
  local pause_answer
@@ -338,7 +338,7 @@ interactive_wizard() {
  local session
  session=$(mktemp /var/log/gerbit-assistente-XXXXXXXX.log)
  exec > >(tee -a "$session") 2>&1
- echo 'GERBIT — ASSISTENTE DE MANUTENÇÃO v3.1'
+ echo 'GERBIT — ASSISTENTE DE MANUTENÇÃO v3.2'
  echo "Log da sessão: $session"
  echo 'Cada ação pede confirmação. Enter mantém a opção de cancelar/não.'
  echo 'Depois de um reboot, execute este mesmo arquivo novamente.'
@@ -680,6 +680,73 @@ security_report() {
  echo 'Resultado baseado na versão do pacote e nos avisos citados; não é teste de exploração.'
  echo 'Builds personalizados, containers, outros hosts e workers independentes não são cobertos.'
 }
+security_disable_upload_progress() {
+ local run=$1 root=/etc/php dir file backup tmp version sapi conflict
+ SEC_UPLOAD_STATUS='PENDENTE — alteração não autorizada'
+ section 'MITIGAÇÃO ADICIONAL — Desativar progresso de upload em sessão'
+ echo 'Será definido session.upload_progress.enabled=0 nos conf.d de PHP encontrados.'
+ echo 'Isso desativa o recurso de acompanhamento de uploads via sessão; não desativa uploads.'
+ echo 'Configurações anteriores serão copiadas para o diretório do relatório.'
+ if ! sequence_confirm 'Aplicar esta configuração adicional recomendada pelo PHP?'; then
+  return 0
+ fi
+ local -a dirs=()
+ shopt -s nullglob
+ for dir in "$root"/*/{cli,fpm,apache2,cgi}/conf.d; do
+  [[ -d $dir ]] || continue
+  dirs+=("$dir")
+ done
+ shopt -u nullglob
+ if ((${#dirs[@]} == 0)); then
+  SEC_UPLOAD_STATUS='PENDENTE — nenhum diretório padrão conf.d encontrado'
+  echo "$SEC_UPLOAD_STATUS"; return 0
+ fi
+ backup="$run/upload-progress-backup"
+ install -d -m 700 "$backup"
+ # Primeiro valida todos os destinos, antes de alterar o primeiro.
+ for dir in "${dirs[@]}"; do
+  file="$dir/zzzz-gerbit-security-upload-progress.ini"
+  if [[ -L $file || ( -e $file && ! -f $file ) ]]; then
+   echo "Destino não regular; operação bloqueada: $file"; return 1
+  fi
+ done
+ : > "$run/upload-progress-files.txt"
+ for dir in "${dirs[@]}"; do
+  file="$dir/zzzz-gerbit-security-upload-progress.ini"
+  if [[ -f $file ]]; then
+   install -d -m 700 "$backup${dir}"
+   cp -a -- "$file" "$backup$file"
+   printf 'ANTERIOR\t%s\n' "$file" >> "$run/upload-progress-files.txt"
+  else
+   printf 'NOVO\t%s\n' "$file" >> "$run/upload-progress-files.txt"
+  fi
+  tmp=$(mktemp "$dir/.gerbit-upload-XXXXXXXX")
+  printf '%s\n' \
+   '; Gerbit: orientação PHP de 23/10/2026 — session upload progress' \
+   '; https://www.php.net/archive/2026.php' \
+   'session.upload_progress.enabled=0' > "$tmp"
+  chmod 644 "$tmp"
+  chown root:root "$tmp"
+  mv -f -- "$tmp" "$file"
+  printf 'CONFIGURADO: %s\n' "$file"
+ done
+ SEC_UPLOAD_STATUS='CONFIGURADO — aguarda reinicialização e verificação dos serviços web'
+ # Overrides por pool/Apache podem prevalecer sobre conf.d. Não imprime conteúdo sensível.
+ local -a checks=()
+ for dir in "$root"/*/fpm/pool.d /etc/apache2; do [[ ! -d $dir ]] || checks+=("$dir"); done
+ if ((${#checks[@]})); then
+  conflict=$(grep -RIlE '^[[:space:]]*[^;#[:space:]].*session[.]upload_progress[.]enabled' "${checks[@]}" 2>/dev/null || true)
+  if [[ -n $conflict ]]; then
+   echo 'ATENÇÃO: existem referências em pools/Apache que podem sobrescrever o conf.d:'
+   printf '%s\n' "$conflict"
+   SEC_UPLOAD_STATUS='CONFIGURADO — overrides detectados; configuração efetiva precisa ser verificada'
+  fi
+ fi
+ echo "Backup dos arquivos anteriores: $backup"
+ echo "Lista de arquivos criados/alterados: $run/upload-progress-files.txt"
+ echo 'Para reverter: restaure os arquivos ANTERIOR do backup e remova somente os arquivos NOVO listados; reinicie os serviços.'
+}
+
 security_flow() {
  ((EUID == 0)) || { echo 'Execute com sudo'; return 1; }
  [[ -t 0 ]] || { echo 'Execute em terminal interativo'; return 1; }
@@ -711,7 +778,7 @@ security_flow() {
  echo 'Fontes: https://www.php.net/archive/2026.php#2026-10-21-5'
  echo 'https://ubuntu.com/security/notices/USN-8948-1 | https://ubuntu.com/security/notices/USN-8948-2'
  echo 'Em 23/10, PHP também orientou session.upload_progress.enabled=0 para CVE-2026-115560.'
- echo 'Esta etapa não avalia nem altera essa configuração; não certifica proteção contra todas as falhas PHP.'
+ echo 'Esta etapa oferecerá aplicar essa configuração com backup e reiniciar os serviços identificados.'
  sequence_confirm 'Atualizar os índices APT e procurar pacotes corrigidos nas linhas atuais?' || return 0
  apt-get -o APT::Update::Error-Mode=any update
  apt-get check
@@ -759,6 +826,8 @@ security_flow() {
   mapfile -t services < <(systemctl list-units --type=service --state=active --no-legend --plain 'php*-fpm.service' | awk '{print $1}')
   if compgen -G '/etc/apache2/mods-enabled/php*.load' >/dev/null && systemctl is-active --quiet apache2; then services+=(apache2.service); fi
  fi
+ local SEC_UPLOAD_STATUS='PENDENTE' SEC_UPLOAD_RESTARTED=0
+ security_disable_upload_progress "$run"
  section 'ATIVAÇÃO — Reiniciar processos PHP dos serviços identificados'
  if ((${#services[@]})); then
   printf 'Serviço: %s\n' "${services[@]}"
@@ -771,6 +840,7 @@ security_flow() {
     fi
    done
    for p in "${services[@]}"; do systemctl restart "$p"; systemctl is-active --quiet "$p"; done
+   SEC_UPLOAD_RESTARTED=1
    echo 'Serviços identificados reiniciados e ativos. Valide o atendimento HTTP das aplicações.'
   else
    echo 'PENDENTE: workers não foram reiniciados por esta etapa; não considerar a correção ativada.'
@@ -791,7 +861,21 @@ security_flow() {
   echo 'A modernização continua disponível em --sequence, com decisões separadas.'
  fi
  echo 'PENDENTE de auditoria específica: pools/configurações efetivas, workers fora do systemd e containers.'
- echo 'CVE-2026-115560 requer avaliação da orientação adicional de session.upload_progress.enabled.'
+ section 'RESULTADO — session.upload_progress.enabled'
+ echo "$SEC_UPLOAD_STATUS"
+ if ((SEC_UPLOAD_RESTARTED)); then
+  echo 'Serviços web identificados reiniciados. Configurações de pools/virtualhosts ainda podem sobrescrever o valor.'
+ else
+  echo 'PENDENTE: ativar a configuração reiniciando todos os workers PHP afetados.'
+ fi
+ local phpbin effective
+ for phpbin in /usr/bin/php[0-9]*; do
+  [[ $phpbin =~ /php[0-9]+[.][0-9]+$ && -x $phpbin ]] || continue
+  if effective=$("$phpbin" -r 'echo ini_get("session.upload_progress.enabled") ? "ATIVADO" : "DESATIVADO";' 2>/dev/null); then
+   printf 'Verificação CLI (%s): %s — não comprova configuração HTTP/FPM.\n' "$phpbin" "$effective"
+  fi
+ done
+ echo 'Pendentes de verificação própria: CGI persistente, pools/virtualhosts, supervisores e containers.' 
  echo "Relatório completo: $run/security.log"
 }
 
