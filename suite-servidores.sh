@@ -1,7 +1,66 @@
 #!/usr/bin/env bash
-# Suíte Gerbit v3.2: assistente interativo de manutenção.
+# Suíte Gerbit v3.3: assistente interativo de manutenção.
 set -Eeuo pipefail
 export LC_ALL=C
+# APT com índices isolados quando uma recuperação for necessária.
+# Não desativa assinaturas, validade, certificados nem altera sources.list.
+apt-get() {
+ local -a options=()
+ [[ -z ${GERBIT_APT_LISTS:-} ]] || options=(-o "Dir::State::lists=$GERBIT_APT_LISTS")
+ command apt-get "${options[@]}" "$@"
+}
+apt-cache() {
+ local -a options=()
+ [[ -z ${GERBIT_APT_LISTS:-} ]] || options=(-o "Dir::State::lists=$GERBIT_APT_LISTS")
+ command apt-cache "${options[@]}" "$@"
+}
+apt_refresh() {
+ apt-get -o APT::Update::Error-Mode=any -o Acquire::Retries=2 \
+  -o Acquire::http::No-Cache=true -o Acquire::https::No-Cache=true \
+  -o Acquire::PDiffs=false update
+}
+apt_recover_indexes() {
+ local parent=/var/lib/apt
+ echo 'Será feita nova coleta de índices, sem usar os índices locais anteriores.'
+ echo 'Os repositórios e as verificações de segurança serão preservados.'
+ sequence_confirm 'Tentar recuperar os índices APT agora?' || return 1
+ [[ -d $parent && ! -L $parent ]] || return 1
+ GERBIT_APT_LISTS=$(mktemp -d "$parent/gerbit-lists-XXXXXXXX")
+ chmod 755 "$GERBIT_APT_LISTS"
+ install -d -m 700 "$GERBIT_APT_LISTS/partial"
+ echo "Índices desta execução: $GERBIT_APT_LISTS"
+ apt_refresh
+}
+apt_run() {
+ local log rc
+ log=$(mktemp /var/tmp/gerbit-apt-error-XXXXXXXX.log)
+ chmod 600 "$log"
+ if apt-get "$@" 2>&1 | tee "$log"; then rm -f "$log"; return 0; else rc=$?; fi
+ if grep -Eq '404|Failed to fetch|Unable to fetch some archives' "$log"; then
+  echo "Falha de download do APT. Detalhes: $log"
+  if apt_recover_indexes; then
+   echo 'Índices recarregados. O APT calculará novamente os candidatos e o plano.'
+   echo 'A nova tentativa será única; confira os pacotes antes de confirmar.'
+   apt-get "$@"
+   return $?
+  fi
+ fi
+ echo 'Operação interrompida; não foram ignorados erros de repositório ou autenticação.'
+ echo "Confira $log, data/hora, acesso à rede, proxy/cache e disponibilidade do repositório."
+ echo 'Repositórios encerrados/arquivados exigem revisão; não são convertidos automaticamente.'
+ return "$rc"
+}
+apt_eol_notice() {
+ local os_id os_version
+ os_id=$(. /etc/os-release; echo "$ID")
+ os_version=$(. /etc/os-release; echo "$VERSION_ID")
+ if [[ $os_id == debian && $os_version == 11 ]]; then
+  echo 'ATENÇÃO: Debian11 encerrou LTS oficial em 31/08/2026.'
+  echo 'Recuperar o APT não fornece novas correções de segurança para uma release encerrada.'
+  echo 'PHP7.4 depende de fornecedor ELTS ou migração validada para uma release suportada.'
+ fi
+}
+
 main() {
  local mode=${1:---diagnose}
  (($# == 0)) || shift
@@ -105,7 +164,7 @@ HELP
  lsblk -f > "$run/storage-before.txt"
  local -a apt=(apt-get -o APT::Update::Error-Mode=any)
  section 'ETAPA — Atualização dos índices dos repositórios'
- "${apt[@]}" update
+ apt_refresh
  "${apt[@]}" check
  # Sem -y: o operador revisa remoções e responde perguntas de configuração.
  section 'ETAPA — Simulação da atualização de pacotes'
@@ -115,7 +174,7 @@ HELP
  read -r -p 'Executar o plano? [s/N]: ' answer
  [[ $answer == s || $answer == S ]] || { echo 'Cancelado antes da atualização de pacotes.'; return 10; }
  section 'ETAPA — Execução da atualização de pacotes'
- "${apt[@]}" dist-upgrade
+ apt_run dist-upgrade
  "${apt[@]}" check
  [[ -z $(dpkg --audit) ]] || { echo 'Há pendências dpkg após atualização'; return 1; }
  if [[ -e /run/reboot-required ]]; then
@@ -126,7 +185,7 @@ HELP
   echo 'Pacotes atualizados. Valide serviços/aplicações; nenhuma aplicação foi homologada automaticamente.'
   return 0
  fi
- "${apt[@]}" --no-remove install update-manager-core
+ apt_run --no-remove install update-manager-core
  [[ ! -e /run/reboot-required ]] || { echo 'Reinicie antes do upgrade da distribuição'; return 20; }
  [[ -z $(apt list --upgradable 2>/dev/null | tail -n +2) ]] || { echo 'Ainda há pacotes atualizáveis, possivelmente faseados. Resolva antes do upgrade.'; return 1; }
  local cfg=/etc/update-manager/release-upgrades
@@ -221,24 +280,24 @@ tar -C / -czf "$RUN/configuration.tar.gz" "${BACKUP_PATHS[@]}"
 [[ $(df -Pk / | awk 'NR==2{print $4}') -ge 1048576 ]] || die 'Exige pelo menos 1 GiB livre em /'
 APT=(apt-get -o APT::Update::Error-Mode=any)
 section 'ETAPA — Atualização dos índices APT para PHP'
-"${APT[@]}" update
+apt_refresh
 "${APT[@]}" check
 if ((ADD_REPO)); then
- "${APT[@]}" --no-remove -y install ca-certificates curl
+ apt_run --no-remove -y install ca-certificates curl
  if [[ $ID == debian ]]; then
   curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
    https://packages.sury.org/debsuryorg-archive-keyring.deb -o "$RUN/keyring.deb"
-  "${APT[@]}" --no-remove -y install "$RUN/keyring.deb"
+  apt_run --no-remove -y install "$RUN/keyring.deb"
   # Evita duplicar uma configuração Sury existente, mesmo em deb822.
   if ! grep -RqsE '^[[:space:]]*(deb .*|URIs:.*)https://packages\.sury\.org/php' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
    printf 'deb [signed-by=/usr/share/keyrings/debsuryorg-archive-keyring.gpg] https://packages.sury.org/php/ %s main\n' "$VERSION_CODENAME" > /etc/apt/sources.list.d/php-upgrade-sury.list
   fi
  else
-  "${APT[@]}" --no-remove -y install software-properties-common
+  apt_run --no-remove -y install software-properties-common
   add-apt-repository -y ppa:ondrej/php
  fi
  section 'ETAPA — Atualização dos índices APT para PHP'
-"${APT[@]}" update
+apt_refresh
 fi
 if [[ $TARGET == latest ]]; then
  command -v curl >/dev/null || die 'Instale curl ou informe --target 8.5'
@@ -281,7 +340,7 @@ section 'ETAPA — Simulação da instalação do PHP'
 "${APT[@]}" -s --no-remove install "${PACKAGES[@]}" | tee "$RUN/plan.txt"
 section 'ETAPA — Instalação dos pacotes PHP'
 echo 'Instalando: pacotes podem iniciar/reiniciar serviços e alterar alternatives automáticas.'
-DEBIAN_FRONTEND=noninteractive "${APT[@]}" -y --no-remove \
+DEBIAN_FRONTEND=noninteractive apt_run -y --no-remove \
  -o Dpkg::Options::=--force-confold install "${PACKAGES[@]}"
 "/usr/bin/php${TARGET}" -v
 "/usr/bin/php${TARGET}" -m > "$RUN/modules-after.txt"
@@ -322,7 +381,7 @@ screen_header() {
  if [[ -t 0 && ${TERM:-dumb} != dumb && -w /dev/tty ]]; then
   printf '\033[2J\033[H' > /dev/tty
  fi
- printf '\nGERBIT — ASSISTENTE DE MANUTENÇÃO v3.2\n%s\n\n' "$1"
+ printf '\nGERBIT — ASSISTENTE DE MANUTENÇÃO v3.3\n%s\n\n' "$1"
 }
 pause_screen() {
  local pause_answer
@@ -338,7 +397,7 @@ interactive_wizard() {
  local session
  session=$(mktemp /var/log/gerbit-assistente-XXXXXXXX.log)
  exec > >(tee -a "$session") 2>&1
- echo 'GERBIT — ASSISTENTE DE MANUTENÇÃO v3.2'
+ echo 'GERBIT — ASSISTENTE DE MANUTENÇÃO v3.3'
  echo "Log da sessão: $session"
  echo 'Cada ação pede confirmação. Enter mantém a opção de cancelar/não.'
  echo 'Depois de um reboot, execute este mesmo arquivo novamente.'
@@ -767,6 +826,7 @@ security_flow() {
  exec > >(tee -a "$run/security.log") 2>&1
  screen_header 'Correção prioritária — PHP2Shell'
  echo "Sistema: $PRETTY_NAME | $(uname -m)"
+ apt_eol_notice
  echo "Relatório: $run/security.log"
  echo 'Escopo: CVE-2026-109618 e CVE-2026-109619, publicadas em 21/10/2026.'
  echo 'Prioridade: corrigir todas as linhas instaladas sem migrar a distribuição ou os sites.'
@@ -780,7 +840,7 @@ security_flow() {
  echo 'Em 23/10, PHP também orientou session.upload_progress.enabled=0 para CVE-2026-115560.'
  echo 'Esta etapa oferecerá aplicar essa configuração com backup e reiniciar os serviços identificados.'
  sequence_confirm 'Atualizar os índices APT e procurar pacotes corrigidos nas linhas atuais?' || return 0
- apt-get -o APT::Update::Error-Mode=any update
+ apt_refresh
  apt-get check
  [[ -z $(dpkg --audit) ]] || { echo 'dpkg incompleto. Use --repair antes de tentar novamente.'; return 1; }
  local p n line candidate q name active_config unresolved_candidates=0
@@ -815,7 +875,7 @@ security_flow() {
   # Guarda serviços ativos antes da atualização, para reiniciar inclusive workers antigos.
   mapfile -t services < <(systemctl list-units --type=service --state=active --no-legend --plain 'php*-fpm.service' | awk '{print $1}')
   if compgen -G '/etc/apache2/mods-enabled/php*.load' >/dev/null && systemctl is-active --quiet apache2; then services+=(apache2.service); fi
-  apt-get --only-upgrade --no-remove install "${upgrades[@]}"
+  apt_run --only-upgrade --no-remove install "${upgrades[@]}"
   apt-get check
   security_report
  else
