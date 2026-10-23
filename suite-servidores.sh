@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Suíte Gerbit v2.2: assistente interativo de manutenção.
+# Suíte Gerbit v2.3: assistente interativo de manutenção.
 set -Eeuo pipefail
 export LC_ALL=C
 main() {
@@ -95,19 +95,23 @@ HELP
  echo "Inventário e configurações: $run (contém dados sensíveis; acesso root)"
  exec > >(tee -a "$run/execution.log") 2>&1
  trap 'echo "Etapa falhou na linha $LINENO. Consulte /var/backups/gerbit-suite-* e /var/log/apt. Não há rollback automático."' ERR
+ section 'ETAPA — Cópia local das configurações e inventário'
  tar -C / -czf "$run/etc.tar.gz" etc
  dpkg-query -W > "$run/packages-before.txt"
  apt-mark showmanual > "$run/manual-before.txt"
  lsblk -f > "$run/storage-before.txt"
  local -a apt=(apt-get -o APT::Update::Error-Mode=any)
+ section 'ETAPA — Atualização dos índices dos repositórios'
  "${apt[@]}" update
  "${apt[@]}" check
  # Sem -y: o operador revisa remoções e responde perguntas de configuração.
+ section 'ETAPA — Simulação da atualização de pacotes'
  "${apt[@]}" -s dist-upgrade | tee "$run/package-plan.txt"
  echo 'A operação pode substituir pacotes, remover dependências e reiniciar serviços.'
  local answer
  read -r -p 'Executar o plano? [s/N]: ' answer
  [[ $answer == s || $answer == S ]] || { echo 'Cancelado antes da atualização de pacotes.'; return 0; }
+ section 'ETAPA — Execução da atualização de pacotes'
  "${apt[@]}" dist-upgrade
  "${apt[@]}" check
  [[ -z $(dpkg --audit) ]] || { echo 'Há pendências dpkg após atualização'; return 1; }
@@ -133,6 +137,7 @@ HELP
  echo 'Abrindo o atualizador oficial para a próxima LTS disponível.'
  echo 'PPAs podem ser desativados. Não reative repositórios de releases antigas.'
  echo 'Responda às perguntas do atualizador. Não avance outra LTS sem validar aplicações.'
+ section 'ETAPA — Atualizador da distribuição Ubuntu'
  do-release-upgrade
  echo 'Confira /var/log/dist-upgrade. Reinicie se solicitado; valide rede, SSH, bancos e aplicações.'
  echo 'A etapa PHP é separada: sudo bash suite-servidores.sh --php --diagnose'
@@ -212,6 +217,7 @@ tar -C / -czf "$RUN/configuration.tar.gz" "${BACKUP_PATHS[@]}"
 [[ -z $(dpkg --audit) ]] || die 'dpkg tem pendências; corrija antes'
 [[ $(df -Pk / | awk 'NR==2{print $4}') -ge 1048576 ]] || die 'Exige pelo menos 1 GiB livre em /'
 APT=(apt-get -o APT::Update::Error-Mode=any)
+section 'ETAPA — Atualização dos índices APT para PHP'
 "${APT[@]}" update
 "${APT[@]}" check
 if ((ADD_REPO)); then
@@ -228,7 +234,8 @@ if ((ADD_REPO)); then
   "${APT[@]}" --no-remove -y install software-properties-common
   add-apt-repository -y ppa:ondrej/php
  fi
- "${APT[@]}" update
+ section 'ETAPA — Atualização dos índices APT para PHP'
+"${APT[@]}" update
 fi
 if [[ $TARGET == latest ]]; then
  command -v curl >/dev/null || die 'Instale curl ou informe --target 8.5'
@@ -267,7 +274,9 @@ for p in "${PACKAGES[@]}"; do
 done
 apt-cache policy "${PACKAGES[@]}" > "$RUN/candidates.txt"
 # Bloqueia remoções; APT respeita holds e assinatura dos repositórios.
+section 'ETAPA — Simulação da instalação do PHP'
 "${APT[@]}" -s --no-remove install "${PACKAGES[@]}" | tee "$RUN/plan.txt"
+section 'ETAPA — Instalação dos pacotes PHP'
 echo 'Instalando: pacotes podem iniciar/reiniciar serviços e alterar alternatives automáticas.'
 DEBIAN_FRONTEND=noninteractive "${APT[@]}" -y --no-remove \
  -o Dpkg::Options::=--force-confold install "${PACKAGES[@]}"
@@ -284,6 +293,7 @@ echo 'Versões anteriores foram mantidas. Não execute autoremove antes de homol
 
 backup_question() {
  local answer
+ section 'DECISÃO — Backup externo ou snapshot'
  echo 'Backup externo/snapshot deste servidor:'
  echo '  1) Tenho backup recuperável e revisei o impacto nas aplicações'
  echo '  2) Prosseguir SEM backup externo (somente cópia local de configurações)'
@@ -299,12 +309,17 @@ backup_question() {
   *) echo 'Etapa cancelada.'; return 1;;
  esac
 }
+section() {
+ printf '\n\n────────────────────────────────────────────────────────────\n'
+ printf '  %s\n' "$1"
+ printf '────────────────────────────────────────────────────────────\n\n'
+}
 screen_header() {
  # Limpa apenas o terminal; preserva o histórico textual no log.
  if [[ -t 0 && ${TERM:-dumb} != dumb && -w /dev/tty ]]; then
   printf '\033[2J\033[H' > /dev/tty
  fi
- printf '\nGERBIT — ASSISTENTE DE MANUTENÇÃO v2.2\n%s\n\n' "$1"
+ printf '\nGERBIT — ASSISTENTE DE MANUTENÇÃO v2.3\n%s\n\n' "$1"
 }
 pause_screen() {
  local pause_answer
@@ -314,20 +329,20 @@ pause_screen() {
 interactive_wizard() {
  ((EUID == 0)) || { echo 'Execute: sudo bash suite-servidores.sh'; return 1; }
  [[ -t 0 ]] || { echo 'O assistente requer um terminal interativo'; return 1; }
- local self choice rc target answer
+ local self choice rc target answer action_title started last_action='Nenhuma ação executada nesta sessão.'
  self=$(readlink -f "${BASH_SOURCE[0]}")
  umask 077
  local session
  session=$(mktemp /var/log/gerbit-assistente-XXXXXXXX.log)
  exec > >(tee -a "$session") 2>&1
- echo 'GERBIT — ASSISTENTE DE MANUTENÇÃO v2.2'
+ echo 'GERBIT — ASSISTENTE DE MANUTENÇÃO v2.3'
  echo "Log da sessão: $session"
  echo 'Cada ação pede confirmação. Enter mantém a opção de cancelar/não.'
  echo 'Depois de um reboot, execute este mesmo arquivo novamente.'
  echo 'Aplicações e bancos exigem revisão de compatibilidade; não há rollback automático.'
  while true; do
   screen_header 'Menu principal — escolha uma opção'
-  echo "Log: $session"
+  printf 'Última ação: %s\nLog: %s\n\n' "$last_action" "$session"
   printf '%s\n' \
    '1) Diagnóstico geral e versões dos sistemas' \
    '2) Atualizar pacotes da distribuição atual' \
@@ -342,15 +357,20 @@ interactive_wizard() {
   echo "DECISÃO: opção ${choice:-0}"
   rc=0
   case "$choice" in
-   1) screen_header 'Diagnóstico geral';;
-   2) screen_header 'Atualização dos pacotes';;
-   3) screen_header 'Atualização da distribuição Ubuntu';;
-   4) screen_header 'Diagnóstico do PHP';;
-   5) screen_header 'Atualização do PHP';;
-   6) screen_header 'Investigação dos serviços';;
-   7) screen_header 'Verificação e correção do APT';;
-   8) screen_header 'Reinicialização do servidor';;
+   1) action_title='Diagnóstico geral';;
+   2) action_title='Atualização dos pacotes';;
+   3) action_title='Atualização da distribuição Ubuntu';;
+   4) action_title='Diagnóstico do PHP';;
+   5) action_title='Atualização do PHP';;
+   6) action_title='Investigação dos serviços';;
+   7) action_title='Verificação e correção do APT';;
+   8) action_title='Reinicialização do servidor';;
+   0|'') echo "Encerrado. Log: $session"; return 0;;
+   *) echo 'Opção inválida'; pause_screen; continue;;
   esac
+  screen_header "$action_title"
+  started=$(date '+%H:%M:%S')
+  section "INÍCIO DA AÇÃO $choice — $action_title — $started"
   case "$choice" in
    1)
     if bash "$self" --diagnose; then :; else rc=$?; fi
@@ -404,11 +424,18 @@ interactive_wizard() {
    0|'') echo "Encerrado. Log: $session"; return 0;;
    *) echo 'Opção inválida';;
   esac
+  section "FIM DA AÇÃO $choice — $action_title — $(date '+%H:%M:%S')"
   if ((rc == 20)); then
+   last_action="$action_title — requer reinicialização"
    echo 'Etapa interrompida: reboot necessário. Use a opção 8 quando estiver pronto.'
   elif ((rc != 0)); then
+   last_action="$action_title — interrompida (código $rc)"
    echo "Etapa interrompida (código $rc). Consulte o erro acima e o log; nenhuma correção foi presumida."
+  else
+   last_action="$action_title — encerrada sem erro reportado"
+   echo 'Etapa encerrada. Confira as mensagens acima: cancelamentos também podem retornar sem erro.'
   fi
+  printf '\nResumo: %s\nLog completo: %s\n' "$last_action" "$session"
   pause_screen
  done
 }
