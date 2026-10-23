@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Suíte Gerbit v2.3: assistente interativo de manutenção.
+# Suíte Gerbit v3.0: assistente interativo de manutenção.
 set -Eeuo pipefail
 export LC_ALL=C
 main() {
@@ -18,7 +18,9 @@ main() {
  --help|-h)
  cat <<'HELP'
 Suíte de manutenção (APT nativo; execute com sudo):
- Sem argumentos: abre o assistente interativo.
+ Sem argumentos: sequência guiada de sistema e PHP (retoma progresso).
+ --wizard     Abre o menu manual de ferramentas
+ --sequence   Abre a sequência guiada
  --diagnose   Inventário local; não atualiza índices nem instala nada
  --packages --backup-confirmed
               Atualiza pacotes da versão atual, com plano e confirmação interativa
@@ -55,7 +57,7 @@ HELP
  [[ ! -e /run/reboot-required ]] || echo 'REINICIALIZAÇÃO PENDENTE'
  [[ $mode != --diagnose ]] || return 0
  ((EUID == 0)) || { echo 'Execute com sudo'; return 1; }
- ((backup)) || backup_question || return 0
+ ((backup)) || backup_question || return 10
  [[ -t 0 ]] || { echo 'Execute em terminal interativo, preferencialmente dentro de tmux/screen.'; return 1; }
  case "$ID:${VERSION_ID:-}" in
  ubuntu:20.04|ubuntu:22.04|ubuntu:24.04|ubuntu:26.04|debian:11|debian:12|debian:13) ;;
@@ -81,7 +83,7 @@ HELP
    echo 'Estes serviços já estão com falha. Isso não comprova que podem ser ignorados.'
    local decision
    read -r -p 'Digite ACEITAR FALHAS para prosseguir apesar delas, ou Enter para cancelar: ' decision
-   [[ $decision == 'ACEITAR FALHAS' ]] || return 0
+   [[ $decision == 'ACEITAR FALHAS' ]] || return 10
    echo 'DECISÃO: operador aceitou as falhas exibidas para esta execução.'
   elif [[ $health != running ]]; then
    echo "Estado systemd impeditivo: $health"; return 1
@@ -110,7 +112,7 @@ HELP
  echo 'A operação pode substituir pacotes, remover dependências e reiniciar serviços.'
  local answer
  read -r -p 'Executar o plano? [s/N]: ' answer
- [[ $answer == s || $answer == S ]] || { echo 'Cancelado antes da atualização de pacotes.'; return 0; }
+ [[ $answer == s || $answer == S ]] || { echo 'Cancelado antes da atualização de pacotes.'; return 10; }
  section 'ETAPA — Execução da atualização de pacotes'
  "${apt[@]}" dist-upgrade
  "${apt[@]}" check
@@ -195,7 +197,7 @@ if command -v systemctl >/dev/null; then
 fi
 [[ $MODE == apply ]] || { echo 'Diagnóstico concluído. --apply efetua alterações; consulte --help.'; exit 0; }
 ((EUID == 0)) || die 'Execute com sudo/root'
-((ACK)) || { backup_question || exit 0; }
+((ACK)) || { backup_question || exit 10; }
 for panel in /usr/local/cpanel /usr/local/psa /usr/local/directadmin /www/server/panel; do
  [[ ! -e $panel ]] || die "Painel detectado: $panel. Utilize o gerenciador do painel."
 done
@@ -262,7 +264,7 @@ PACKAGES=("php${TARGET}-cli" "php${TARGET}-common")
 for p in "${INSTALLED[@]}"; do
  case "$p" in
  libapache2-mod-php*) die 'mod_php detectado. Migração Apache requer procedimento próprio; nenhum PHP foi instalado.';;
- php[0-9]*-*) suffix=${p#*-}; PACKAGES+=("php${TARGET}-${suffix}");;
+ php[0-9]*-*) suffix=${p#*-}; if [[ $suffix == json ]] && dpkg --compare-versions "$TARGET" ge 8.0; then continue; fi; PACKAGES+=("php${TARGET}-${suffix}");;
  php-*) suffix=${p#php-}; case "$suffix" in pear|common) ;; *) PACKAGES+=("php${TARGET}-${suffix}");; esac;;
  esac
 done
@@ -270,7 +272,7 @@ mapfile -t PACKAGES < <(printf '%s\n' "${PACKAGES[@]}" | sort -u)
 for p in "${PACKAGES[@]}"; do
  candidate=$(apt-cache policy "$p" | awk '/Candidate:/{print $2}')
  [[ -n $candidate && $candidate != '(none)' ]] || die "Sem candidato para $p. Verifique repositório/extensão; não será ignorada."
- [[ $candidate != *'~'* ]] || die "Pré-release recusado: $p $candidate"
+ [[ ! $candidate =~ (alpha|beta|RC|rc)[0-9] ]] || die "Pré-release recusado: $p $candidate"
 done
 apt-cache policy "${PACKAGES[@]}" > "$RUN/candidates.txt"
 # Bloqueia remoções; APT respeita holds e assinatura dos repositórios.
@@ -319,7 +321,7 @@ screen_header() {
  if [[ -t 0 && ${TERM:-dumb} != dumb && -w /dev/tty ]]; then
   printf '\033[2J\033[H' > /dev/tty
  fi
- printf '\nGERBIT — ASSISTENTE DE MANUTENÇÃO v2.3\n%s\n\n' "$1"
+ printf '\nGERBIT — ASSISTENTE DE MANUTENÇÃO v3.0\n%s\n\n' "$1"
 }
 pause_screen() {
  local pause_answer
@@ -335,7 +337,7 @@ interactive_wizard() {
  local session
  session=$(mktemp /var/log/gerbit-assistente-XXXXXXXX.log)
  exec > >(tee -a "$session") 2>&1
- echo 'GERBIT — ASSISTENTE DE MANUTENÇÃO v2.3'
+ echo 'GERBIT — ASSISTENTE DE MANUTENÇÃO v3.0'
  echo "Log da sessão: $session"
  echo 'Cada ação pede confirmação. Enter mantém a opção de cancelar/não.'
  echo 'Depois de um reboot, execute este mesmo arquivo novamente.'
@@ -352,6 +354,7 @@ interactive_wizard() {
    '6) Investigar serviços com falha e obter orientações' \
    '7) Verificar pendências do APT/dpkg e oferecer correções' \
    '8) Reiniciar o servidor' \
+   '9) Sequência guiada — sistema e PHP' \
    '0) Sair [padrão]'
   read -r -p 'Escolha: ' choice || break
   echo "DECISÃO: opção ${choice:-0}"
@@ -365,6 +368,7 @@ interactive_wizard() {
    6) action_title='Investigação dos serviços';;
    7) action_title='Verificação e correção do APT';;
    8) action_title='Reinicialização do servidor';;
+   9) action_title='Sequência guiada';;
    0|'') echo "Encerrado. Log: $session"; return 0;;
    *) echo 'Opção inválida'; pause_screen; continue;;
   esac
@@ -421,11 +425,15 @@ interactive_wizard() {
      systemctl reboot
      return
     fi;;
+   9) if bash "$self" --sequence; then :; else rc=$?; fi;;
    0|'') echo "Encerrado. Log: $session"; return 0;;
    *) echo 'Opção inválida';;
   esac
   section "FIM DA AÇÃO $choice — $action_title — $(date '+%H:%M:%S')"
-  if ((rc == 20)); then
+  if ((rc == 10)); then
+   last_action="$action_title — cancelada pelo operador"
+   echo 'Etapa cancelada.'
+  elif ((rc == 20)); then
    last_action="$action_title — requer reinicialização"
    echo 'Etapa interrompida: reboot necessário. Use a opção 8 quando estiver pronto.'
   elif ((rc != 0)); then
@@ -464,7 +472,161 @@ repair_stage() {
    [[ $answer != s && $answer != S ]] || apt-get --fix-broken install;;
  esac
 }
-if (($# == 0)) || [[ ${1:-} == --wizard ]]; then
+sequence_confirm() {
+ local reply
+ printf '\n'
+ read -r -p "$1 [s/N]: " reply || return 1
+ [[ $reply == s || $reply == S ]]
+}
+sequence_save() {
+ # Arquivo de dados, nunca executado com source/eval.
+ local tmp
+ tmp=$(mktemp "$SEQ_DIR/state-XXXXXXXX")
+ printf '%s\n' "$SEQ_PHP" "$SEQ_OS" "$SEQ_PHASE" "$SEQ_BOOT" > "$tmp"
+ chmod 600 "$tmp"
+ mv -f "$tmp" "$SEQ_DIR/progress"
+}
+sequence_reboot() {
+ SEQ_BOOT=$(cat /proc/sys/kernel/random/boot_id)
+ sequence_save
+ section 'REINICIALIZAÇÃO NECESSÁRIA — Progresso salvo'
+ echo 'Depois de reconectar, execute: sudo bash suite-servidores.sh'
+ echo 'A sequência reconhecerá o progresso e escolherá a próxima etapa.'
+ echo 'Nenhuma tarefa será executada automaticamente durante o boot.'
+ if sequence_confirm 'Reiniciar agora?'; then
+  systemctl reboot
+ fi
+}
+sequence_flow() {
+ ((EUID == 0)) || { echo 'Execute: sudo bash suite-servidores.sh'; return 1; }
+ [[ -t 0 ]] || { echo 'A sequência exige terminal interativo'; return 1; }
+ local self session reply rc before current boot_now
+ self=$(readlink -f "${BASH_SOURCE[0]}")
+ umask 077
+ local SEQ_DIR=/var/lib/gerbit-suite
+ [[ ! -L $SEQ_DIR ]] || { echo 'Diretório de progresso não pode ser link'; return 1; }
+ install -d -m 700 -o root -g root "$SEQ_DIR"
+ exec 7>"$SEQ_DIR/sequence.lock"
+ flock -n 7 || { echo 'Outra sequência já está aberta'; return 1; }
+ session=$(mktemp /var/log/gerbit-sequencia-XXXXXXXX.log)
+ exec > >(tee -a "$session") 2>&1
+ screen_header 'Sequência guiada — Sistema e PHP'
+ echo "Log desta execução: $session"
+ echo 'A próxima etapa será escolhida pelo assistente; você confirma as mudanças.'
+ echo 'Aplicações e sites exigem homologação; atualização de pacotes não prova compatibilidade.'
+ local SEQ_PHP=latest SEQ_OS=26.04 SEQ_PHASE=system SEQ_BOOT=-
+ if [[ -f $SEQ_DIR/progress && ! -L $SEQ_DIR/progress ]]; then
+  local -a saved=()
+  mapfile -t saved < "$SEQ_DIR/progress"
+  if ((${#saved[@]} != 4)) ||
+   [[ ! ${saved[0]} =~ ^(latest|[0-9]+\.[0-9]+)$ ]] ||
+   [[ ! ${saved[1]} =~ ^(22\.04|24\.04|26\.04)$ ]] ||
+   [[ ! ${saved[2]} =~ ^(system|packages|php|done)$ ]] ||
+   [[ ! ${saved[3]} =~ ^(-|[a-f0-9-]+)$ ]]; then
+   echo 'Progresso inválido. Não será executado.'; return 1
+  fi
+  printf '\nProgresso anterior: PHP %s | Ubuntu alvo %s | etapa %s\n' "${saved[0]}" "${saved[1]}" "${saved[2]}"
+  if [[ ${saved[2]} != done ]] && sequence_confirm 'Retomar esta sequência?'; then
+   SEQ_PHP=${saved[0]}; SEQ_OS=${saved[1]}; SEQ_PHASE=${saved[2]}; SEQ_BOOT=${saved[3]}
+  else
+   sequence_confirm 'Iniciar uma nova sequência e substituir o progresso anterior?' || return 0
+  fi
+ fi
+ if [[ $SEQ_PHASE == system && $SEQ_BOOT == - ]]; then
+  section 'OBJETIVO — Escolha apenas as versões de destino'
+  read -r -p 'Linha PHP desejada (Enter = latest estável): ' reply
+  SEQ_PHP=${reply:-latest}
+  [[ $SEQ_PHP =~ ^(latest|[0-9]+\.[0-9]+)$ ]] || { echo 'Linha inválida'; return 1; }
+  read -r -p 'Ubuntu de destino: 22.04 / 24.04 / 26.04 (Enter = 26.04): ' reply
+  SEQ_OS=${reply:-26.04}
+  [[ $SEQ_OS =~ ^(22\.04|24\.04|26\.04)$ ]] || { echo 'Destino inválido'; return 1; }
+ fi
+ boot_now=$(cat /proc/sys/kernel/random/boot_id)
+ if [[ $SEQ_BOOT != - && $SEQ_BOOT == "$boot_now" ]]; then
+  echo 'A reinicialização pendente ainda não ocorreu.'
+  sequence_reboot; return 20
+ fi
+ SEQ_BOOT=-
+ sequence_save
+ section 'ETAPA AUTOMÁTICA — Diagnóstico inicial'
+ if bash "$self" --diagnose; then :; else
+  echo 'Diagnóstico interrompido; nenhuma atualização iniciada.'; return 1
+ fi
+ while true; do
+  . /etc/os-release
+  case "$ID:${VERSION_ID:-}" in
+   ubuntu:20.04|ubuntu:22.04|ubuntu:24.04|ubuntu:26.04|debian:11|debian:12|debian:13) ;;
+   *) echo 'Sistema sem procedimento implementado. Progresso preservado.'; return 1;;
+  esac
+  case "$SEQ_PHASE" in
+   system)
+    if [[ $ID == ubuntu ]] && dpkg --compare-versions "$VERSION_ID" lt "$SEQ_OS"; then
+     section "PRÓXIMA ETAPA — Atualizar Ubuntu $VERSION_ID para a próxima LTS"
+     echo "Objetivo: Ubuntu $SEQ_OS e PHP $SEQ_PHP. Não serão puladas versões LTS."
+     echo 'Repositórios terceiros, PHP, bancos e aplicações podem precisar de migração.'
+     echo 'O sistema usará o atualizador oficial; a disponibilidade do próximo salto é definida por ele.'
+     sequence_confirm 'Revisou o impacto nas aplicações, tem console e autoriza este salto LTS?' || return 0
+     before=$VERSION_ID
+     if bash "$self" --distro --console-confirmed; then rc=0; else rc=$?; fi
+     if ((rc == 20)); then sequence_reboot; return 20; fi
+     if ((rc == 10)); then echo 'Etapa cancelada. Progresso preservado.'; return 0; fi
+     if ((rc != 0)); then echo 'Upgrade interrompido. Corrija o erro exibido; depois reabra a sequência.'; return "$rc"; fi
+     . /etc/os-release
+     if [[ $VERSION_ID == "$before" ]]; then
+      echo 'O atualizador não confirmou mudança de release. O PHP não será instalado agora.'
+      echo 'Consulte a saída do atualizador e /var/log/dist-upgrade. Progresso preservado.'; return 1
+     fi
+     sequence_reboot; return 20
+    fi
+    if [[ $ID == debian && $VERSION_ID == 11 ]]; then
+     echo 'Debian 11 exige migração de release com roteiro próprio, ainda não implementado nesta suíte.'
+     echo 'Não trocaremos automaticamente os repositórios Debian.'; return 1
+    fi
+    SEQ_PHASE=packages; sequence_save;;
+   packages)
+    section 'PRÓXIMA ETAPA — Atualizar pacotes da distribuição atual'
+    if bash "$self" --packages; then rc=0; else rc=$?; fi
+    if ((rc == 10)); then echo 'Atualização cancelada. PHP não será iniciado.'; return 0; fi
+    if ((rc == 20)); then sequence_reboot; return 20; fi
+    if ((rc != 0)); then
+     echo 'Atualização interrompida. O assistente pode verificar pendências do APT/dpkg.'
+     if sequence_confirm 'Abrir diagnóstico e opções de correção do APT agora?'; then
+      if bash "$self" --repair; then
+       sequence_confirm 'Tentar novamente a atualização dos pacotes?' && continue
+      fi
+     fi
+     return "$rc"
+    fi
+    SEQ_PHASE=php; sequence_save;;
+   php)
+    if [[ -e /run/reboot-required ]]; then sequence_reboot; return 20; fi
+    section "PRÓXIMA ETAPA — Instalar/atualizar PHP $SEQ_PHP"
+    echo 'A instalação não troca automaticamente o PHP dos sites, pools, crons e workers.'
+    sequence_confirm 'Autoriza instalar os pacotes PHP após revisar a compatibilidade das aplicações?' || return 0
+    local -a flags=(--php --apply --target "$SEQ_PHP")
+    if sequence_confirm 'Autorizar repositório de terceiros Sury/ondrej se necessário?'; then flags+=(--add-repo); fi
+    if sequence_confirm 'Ativar o PHP de destino também no terminal?'; then flags+=(--activate-cli); fi
+    if bash "$self" "${flags[@]}"; then rc=0; else rc=$?; fi
+    if ((rc == 10)); then echo 'Instalação cancelada. Progresso preservado.'; return 0; fi
+    if ((rc != 0)); then
+     echo 'O PHP encontrou um impedimento. Veja a mensagem e o log; não faremos outra troca de OS às cegas.'
+     echo 'A versão antiga do Linux foi tratada antes desta etapa. Extensões ausentes exigem análise específica.'
+     return "$rc"
+    fi
+    SEQ_PHASE=done; sequence_save;;
+   done)
+    section 'FIM DA SEQUÊNCIA — Etapas de pacotes e PHP encerradas sem erro'
+    echo 'Pendente: homologar aplicações e migrar o PHP dos sites/pools quando necessário.'
+    echo "Log: $session"
+    echo 'Uma nova execução perguntará se deseja iniciar outra sequência.'
+    return 0;;
+  esac
+ done
+}
+
+if (($# == 0)) || [[ ${1:-} == --sequence ]]; then
+ sequence_flow
+elif [[ ${1:-} == --wizard ]]; then
  interactive_wizard
 elif [[ ${1:-} == --repair ]]; then
  repair_stage
