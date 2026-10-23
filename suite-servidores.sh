@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Suíte Gerbit v3.0: assistente interativo de manutenção.
+# Suíte Gerbit v3.1: assistente interativo de manutenção.
 set -Eeuo pipefail
 export LC_ALL=C
 main() {
@@ -18,9 +18,10 @@ main() {
  --help|-h)
  cat <<'HELP'
 Suíte de manutenção (APT nativo; execute com sudo):
- Sem argumentos: sequência guiada de sistema e PHP (retoma progresso).
+ Sem argumentos: correção prioritária PHP2Shell nas linhas instaladas.
+ --security   Auditoria e atualização das duas CVEs PHP2Shell de 21/10/2026
  --wizard     Abre o menu manual de ferramentas
- --sequence   Abre a sequência guiada
+ --sequence   Modernização de sistema e PHP com progresso salvo
  --diagnose   Inventário local; não atualiza índices nem instala nada
  --packages --backup-confirmed
               Atualiza pacotes da versão atual, com plano e confirmação interativa
@@ -321,7 +322,7 @@ screen_header() {
  if [[ -t 0 && ${TERM:-dumb} != dumb && -w /dev/tty ]]; then
   printf '\033[2J\033[H' > /dev/tty
  fi
- printf '\nGERBIT — ASSISTENTE DE MANUTENÇÃO v3.0\n%s\n\n' "$1"
+ printf '\nGERBIT — ASSISTENTE DE MANUTENÇÃO v3.1\n%s\n\n' "$1"
 }
 pause_screen() {
  local pause_answer
@@ -337,7 +338,7 @@ interactive_wizard() {
  local session
  session=$(mktemp /var/log/gerbit-assistente-XXXXXXXX.log)
  exec > >(tee -a "$session") 2>&1
- echo 'GERBIT — ASSISTENTE DE MANUTENÇÃO v3.0'
+ echo 'GERBIT — ASSISTENTE DE MANUTENÇÃO v3.1'
  echo "Log da sessão: $session"
  echo 'Cada ação pede confirmação. Enter mantém a opção de cancelar/não.'
  echo 'Depois de um reboot, execute este mesmo arquivo novamente.'
@@ -624,7 +625,179 @@ sequence_flow() {
  done
 }
 
-if (($# == 0)) || [[ ${1:-} == --sequence ]]; then
+# Fontes dos limites, consultadas em 23/10/2026:
+# https://www.php.net/archive/2026.php#2026-10-21-5
+# https://ubuntu.com/security/notices/USN-8948-1
+# https://ubuntu.com/security/notices/USN-8948-2
+# https://security-tracker.debian.org/tracker/CVE-2026-109618
+# https://security-tracker.debian.org/tracker/CVE-2026-109619
+# Estes limites tratam somente CVE-2026-109618 e CVE-2026-109619.
+security_version_fixed() {
+ local line=$1 version=$2 os=$3 release=$4 upstream minimum=''
+ SEC_REASON='Correção não comprovada pelos limites conhecidos'
+ [[ $version != '(none)' && -n $version ]] || return 1
+ upstream=${version#*:}; upstream=${upstream%%-*}
+ case "$line" in 8.2) minimum=8.2.35;; 8.3) minimum=8.3.36;; 8.4) minimum=8.4.27;; 8.5) minimum=8.5.12;; esac
+ if [[ -n $minimum ]] && dpkg --compare-versions "$upstream" ge "$minimum"; then
+  SEC_REASON="Atende mínimo upstream $minimum"; return 0
+ fi
+ # Não confundir a versão upstream antiga com ausência de patch do fornecedor.
+ if [[ $os == ubuntu && $version == *ubuntu* && $version != *sury* ]]; then
+  case "$release:$line:$version" in
+   20.04:7.4:7.4.3-4ubuntu2.*) minimum=7.4.3-4ubuntu2.29+esm5;;
+   22.04:8.1:8.1.2-1ubuntu2.*) minimum=8.1.2-1ubuntu2.28;;
+   24.04:8.3:8.3.6-0ubuntu0.24.04.*) minimum=8.3.6-0ubuntu0.24.04.13;;
+   26.04:8.5:8.5.4-0ubuntu1.*) minimum=8.5.4-0ubuntu1.5;;
+   *) minimum='';;
+  esac
+  if [[ -n $minimum ]] && dpkg --compare-versions "$version" ge "$minimum"; then
+   SEC_REASON="Atende backport Ubuntu $minimum (USN-8948)"; return 0
+  fi
+ fi
+ return 1
+}
+security_inventory() {
+ mapfile -t SEC_PACKAGES < <(dpkg-query -W -f='${binary:Package} ${db:Status-Status}\n' | awk '$2=="installed" && ($1 ~ /^php[0-9]+\.[0-9]+-/ || $1 ~ /^libapache2-mod-php[0-9]+\.[0-9]+/) {print $1}')
+ SEC_RUNTIMES=()
+ local p n
+ for p in "${SEC_PACKAGES[@]}"; do
+  n=${p%%:*}
+  if [[ $n =~ ^php[0-9]+\.[0-9]+-(cli|fpm|cgi|phpdbg)$ || $n =~ ^libapache2-mod-php[0-9]+\.[0-9]+$ ]]; then SEC_RUNTIMES+=("$p"); fi
+ done
+}
+security_report() {
+ local p n line version status
+ SEC_UNRESOLVED=0
+ section 'AUDITORIA — Pacotes de execução PHP instalados'
+ for p in "${SEC_RUNTIMES[@]}"; do
+  n=${p%%:*}
+  [[ $n =~ (php)([0-9]+\.[0-9]+) ]] || continue
+  line=${BASH_REMATCH[2]}
+  version=$(dpkg-query -W -f='${Version}' "$p")
+  if security_version_fixed "$line" "$version" "$ID" "$VERSION_ID"; then status='ATENDE AO LIMITE'; else status='PENDENTE'; SEC_UNRESOLVED=$((SEC_UNRESOLVED+1)); fi
+  printf '%s\n  Versão: %s\n  Resultado: %s — %s\n\n' "$p" "$version" "$status" "$SEC_REASON"
+ done
+ echo 'Resultado baseado na versão do pacote e nos avisos citados; não é teste de exploração.'
+ echo 'Builds personalizados, containers, outros hosts e workers independentes não são cobertos.'
+}
+security_flow() {
+ ((EUID == 0)) || { echo 'Execute com sudo'; return 1; }
+ [[ -t 0 ]] || { echo 'Execute em terminal interativo'; return 1; }
+ . /etc/os-release
+ [[ $ID == ubuntu || $ID == debian ]] || { echo 'Auditoria/atualização automática implementada apenas para Debian e Ubuntu.'; return 1; }
+ local panel
+ for panel in /usr/local/cpanel /usr/local/psa /usr/local/directadmin /www/server/panel /etc/pve /etc/proxmox-backup; do
+  [[ ! -e $panel ]] || { echo "Ambiente com procedimento próprio: $panel. Operação bloqueada."; return 1; }
+ done
+ command -v flock >/dev/null || return 1
+ exec 8>/run/lock/gerbit-suite.lock
+ flock -n 8 || { echo 'Outra operação da suíte em execução'; return 1; }
+ exec 9>/run/lock/atualizar-php.lock
+ flock -n 9 || { echo 'Outra atualização PHP em execução'; return 1; }
+ umask 077
+ local run
+ run=$(mktemp -d /var/backups/gerbit-php-security-XXXXXXXX)
+ exec > >(tee -a "$run/security.log") 2>&1
+ screen_header 'Correção prioritária — PHP2Shell'
+ echo "Sistema: $PRETTY_NAME | $(uname -m)"
+ echo "Relatório: $run/security.log"
+ echo 'Escopo: CVE-2026-109618 e CVE-2026-109619, publicadas em 21/10/2026.'
+ echo 'Prioridade: corrigir todas as linhas instaladas sem migrar a distribuição ou os sites.'
+ local -a SEC_PACKAGES=() SEC_RUNTIMES=()
+ local SEC_UNRESOLVED=0 SEC_REASON=''
+ security_inventory
+ ((${#SEC_RUNTIMES[@]})) || { echo 'Nenhum runtime PHP APT identificado; instalação manual/container exige auditoria própria.'; return 1; }
+ security_report
+ echo 'Fontes: https://www.php.net/archive/2026.php#2026-10-21-5'
+ echo 'https://ubuntu.com/security/notices/USN-8948-1 | https://ubuntu.com/security/notices/USN-8948-2'
+ echo 'Em 23/10, PHP também orientou session.upload_progress.enabled=0 para CVE-2026-115560.'
+ echo 'Esta etapa não avalia nem altera essa configuração; não certifica proteção contra todas as falhas PHP.'
+ sequence_confirm 'Atualizar os índices APT e procurar pacotes corrigidos nas linhas atuais?' || return 0
+ apt-get -o APT::Update::Error-Mode=any update
+ apt-get check
+ [[ -z $(dpkg --audit) ]] || { echo 'dpkg incompleto. Use --repair antes de tentar novamente.'; return 1; }
+ local p n line candidate q name active_config unresolved_candidates=0
+ local -a upgrades=() services=()
+ local -A eligible=()
+ section 'PLANO — Correções disponíveis'
+ for p in "${SEC_RUNTIMES[@]}"; do
+  n=${p%%:*}; [[ $n =~ php([0-9]+\.[0-9]+) ]] || continue; line=${BASH_REMATCH[1]}
+  candidate=$(apt-cache policy "$p" | awk '/Candidate:/{print $2}')
+  if security_version_fixed "$line" "$candidate" "$ID" "$VERSION_ID"; then
+   printf '%s: candidato %s — %s\n' "$p" "$candidate" "$SEC_REASON"
+   eligible[$line]=1
+  else
+   printf 'SEM CORREÇÃO COMPROVADA: %s, candidato %s\n' "$p" "${candidate:-ausente}"
+   unresolved_candidates=$((unresolved_candidates+1))
+  fi
+ done
+ # Atualiza runtimes e extensões já instalados apenas das linhas com candidato corrigido.
+ for q in "${SEC_PACKAGES[@]}"; do
+  name=${q%%:*}; [[ $name =~ php([0-9]+\.[0-9]+) ]] || continue; line=${BASH_REMATCH[1]}
+  [[ ${eligible[$line]:-0} != 1 ]] || upgrades+=("$q")
+ done
+ if ((${#upgrades[@]})); then
+  apt-get -s --only-upgrade --no-remove install "${upgrades[@]}"
+  echo 'A instalação pode reiniciar serviços por scripts dos pacotes.'
+  backup_question || return 10
+  sequence_confirm 'Aplicar este plano de atualização PHP nas linhas atuais?' || return 10
+  local -a paths=(etc/apt)
+  for p in etc/php etc/apache2 etc/nginx; do [[ ! -e /$p ]] || paths+=("$p"); done
+  tar -C / -czf "$run/configuration.tar.gz" "${paths[@]}"
+  dpkg-query -W > "$run/packages-before.txt"
+  # Guarda serviços ativos antes da atualização, para reiniciar inclusive workers antigos.
+  mapfile -t services < <(systemctl list-units --type=service --state=active --no-legend --plain 'php*-fpm.service' | awk '{print $1}')
+  if compgen -G '/etc/apache2/mods-enabled/php*.load' >/dev/null && systemctl is-active --quiet apache2; then services+=(apache2.service); fi
+  apt-get --only-upgrade --no-remove install "${upgrades[@]}"
+  apt-get check
+  security_report
+ else
+  echo 'Nenhuma linha tem candidato corrigido disponível neste APT.'
+ fi
+ # Mesmo pacotes previamente atualizados podem ter processos carregados com binários antigos.
+ if ((${#services[@]} == 0)); then
+  mapfile -t services < <(systemctl list-units --type=service --state=active --no-legend --plain 'php*-fpm.service' | awk '{print $1}')
+  if compgen -G '/etc/apache2/mods-enabled/php*.load' >/dev/null && systemctl is-active --quiet apache2; then services+=(apache2.service); fi
+ fi
+ section 'ATIVAÇÃO — Reiniciar processos PHP dos serviços identificados'
+ if ((${#services[@]})); then
+  printf 'Serviço: %s\n' "${services[@]}"
+  if sequence_confirm 'Validar configuração e reiniciar estes serviços para carregar os binários instalados?'; then
+   for p in "${services[@]}"; do
+    if [[ $p =~ ^php([0-9]+\.[0-9]+)-fpm.service$ ]]; then
+     "/usr/sbin/php-fpm${BASH_REMATCH[1]}" -t
+    elif [[ $p == apache2.service ]]; then apache2ctl configtest
+    else echo "Serviço não reconhecido: $p"; return 1
+    fi
+   done
+   for p in "${services[@]}"; do systemctl restart "$p"; systemctl is-active --quiet "$p"; done
+   echo 'Serviços identificados reiniciados e ativos. Valide o atendimento HTTP das aplicações.'
+  else
+   echo 'PENDENTE: workers não foram reiniciados por esta etapa; não considerar a correção ativada.'
+  fi
+ else
+  echo 'Nenhum FPM/Apache com mod_php ativo identificado. CGI, supervisores e containers precisam de análise própria.'
+ fi
+ section 'RESULTADO — Revisão de segurança'
+ security_report
+ if ((SEC_UNRESOLVED || unresolved_candidates)); then
+  echo 'PENDENTE: há linhas sem correção comprovada. Não declarar o servidor protegido.'
+  if [[ $ID == ubuntu && $VERSION_ID == 20.04 ]]; then
+   echo 'Ubuntu20.04/PHP7.4: o fix oficial é 7.4.3-4ubuntu2.29+esm5 via Ubuntu Pro.'
+   echo 'Verifique Ubuntu Pro/ESM e disponibilidade para esta máquina antes de considerar migração.'
+   if command -v pro >/dev/null; then pro status || true; fi
+  fi
+  echo 'Se não houver patch do fornecedor, planeje migração compatível ou restrição de exposição.'
+  echo 'A modernização continua disponível em --sequence, com decisões separadas.'
+ fi
+ echo 'PENDENTE de auditoria específica: pools/configurações efetivas, workers fora do systemd e containers.'
+ echo 'CVE-2026-115560 requer avaliação da orientação adicional de session.upload_progress.enabled.'
+ echo "Relatório completo: $run/security.log"
+}
+
+if (($# == 0)) || [[ ${1:-} == --security ]]; then
+ security_flow
+elif [[ ${1:-} == --sequence ]]; then
  sequence_flow
 elif [[ ${1:-} == --wizard ]]; then
  interactive_wizard
