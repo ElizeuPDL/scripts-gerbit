@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Suíte Gerbit v2: assistente interativo de manutenção.
+# Suíte Gerbit v2.2: assistente interativo de manutenção.
 set -Eeuo pipefail
 export LC_ALL=C
 main() {
@@ -56,7 +56,7 @@ HELP
  [[ $mode != --diagnose ]] || return 0
  ((EUID == 0)) || { echo 'Execute com sudo'; return 1; }
  ((backup)) || backup_question || return 0
- [[ -t 0 && -t 1 ]] || { echo 'Execute em terminal interativo, preferencialmente dentro de tmux/screen.'; return 1; }
+ [[ -t 0 ]] || { echo 'Execute em terminal interativo, preferencialmente dentro de tmux/screen.'; return 1; }
  case "$ID:${VERSION_ID:-}" in
  ubuntu:20.04|ubuntu:22.04|ubuntu:24.04|ubuntu:26.04|debian:11|debian:12|debian:13) ;;
  *) echo 'Distribuição/versão sem fluxo validado. Bloqueado.'; return 1;;
@@ -299,22 +299,36 @@ backup_question() {
   *) echo 'Etapa cancelada.'; return 1;;
  esac
 }
+screen_header() {
+ # Limpa apenas o terminal; preserva o histórico textual no log.
+ if [[ -t 0 && ${TERM:-dumb} != dumb && -w /dev/tty ]]; then
+  printf '\033[2J\033[H' > /dev/tty
+ fi
+ printf '\nGERBIT — ASSISTENTE DE MANUTENÇÃO v2.2\n%s\n\n' "$1"
+}
+pause_screen() {
+ local pause_answer
+ printf '\n'
+ read -r -p 'Pressione Enter para voltar ao menu...' pause_answer || return 0
+}
 interactive_wizard() {
  ((EUID == 0)) || { echo 'Execute: sudo bash suite-servidores.sh'; return 1; }
- [[ -t 0 && -t 1 ]] || { echo 'O assistente requer um terminal interativo'; return 1; }
+ [[ -t 0 ]] || { echo 'O assistente requer um terminal interativo'; return 1; }
  local self choice rc target answer
  self=$(readlink -f "${BASH_SOURCE[0]}")
  umask 077
  local session
  session=$(mktemp /var/log/gerbit-assistente-XXXXXXXX.log)
  exec > >(tee -a "$session") 2>&1
- echo 'GERBIT — ASSISTENTE DE MANUTENÇÃO v2'
+ echo 'GERBIT — ASSISTENTE DE MANUTENÇÃO v2.2'
  echo "Log da sessão: $session"
  echo 'Cada ação pede confirmação. Enter mantém a opção de cancelar/não.'
  echo 'Depois de um reboot, execute este mesmo arquivo novamente.'
  echo 'Aplicações e bancos exigem revisão de compatibilidade; não há rollback automático.'
  while true; do
-  printf '\n%s\n' \
+  screen_header 'Menu principal — escolha uma opção'
+  echo "Log: $session"
+  printf '%s\n' \
    '1) Diagnóstico geral e versões dos sistemas' \
    '2) Atualizar pacotes da distribuição atual' \
    '3) Atualizar Ubuntu para a próxima LTS (interativo)' \
@@ -327,6 +341,16 @@ interactive_wizard() {
   read -r -p 'Escolha: ' choice || break
   echo "DECISÃO: opção ${choice:-0}"
   rc=0
+  case "$choice" in
+   1) screen_header 'Diagnóstico geral';;
+   2) screen_header 'Atualização dos pacotes';;
+   3) screen_header 'Atualização da distribuição Ubuntu';;
+   4) screen_header 'Diagnóstico do PHP';;
+   5) screen_header 'Atualização do PHP';;
+   6) screen_header 'Investigação dos serviços';;
+   7) screen_header 'Verificação e correção do APT';;
+   8) screen_header 'Reinicialização do servidor';;
+  esac
   case "$choice" in
    1)
     if bash "$self" --diagnose; then :; else rc=$?; fi
@@ -385,6 +409,7 @@ interactive_wizard() {
   elif ((rc != 0)); then
    echo "Etapa interrompida (código $rc). Consulte o erro acima e o log; nenhuma correção foi presumida."
   fi
+  pause_screen
  done
 }
 repair_stage() {
