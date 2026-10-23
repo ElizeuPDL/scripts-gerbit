@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Suíte Gerbit v3.3: assistente interativo de manutenção.
+# Suíte Gerbit v3.4: assistente interativo de manutenção.
 set -Eeuo pipefail
 export LC_ALL=C
 # APT com índices isolados quando uma recuperação for necessária.
@@ -79,6 +79,7 @@ main() {
 Suíte de manutenção (APT nativo; execute com sudo):
  Sem argumentos: correção prioritária PHP2Shell nas linhas instaladas.
  --security   Auditoria e atualização das duas CVEs PHP2Shell de 21/10/2026
+ --debian-upgrade  Migração guiada Debian11 → Debian12 (amd64/GRUB)
  --wizard     Abre o menu manual de ferramentas
  --sequence   Modernização de sistema e PHP com progresso salvo
  --diagnose   Inventário local; não atualiza índices nem instala nada
@@ -91,7 +92,7 @@ Suíte de manutenção (APT nativo; execute com sudo):
               Etapa PHP integrada; use --php --help
  --help
 Pacotes: Ubuntu 20.04/22.04/24.04/26.04; Debian 11/12/13.
-Upgrade de distribuição: somente Ubuntu LTS. Debian exige plano por release.
+Upgrade de distribuição: Ubuntu LTS ou Debian11 → Debian12 via --debian-upgrade.
 Não atualiza aplicações, bancos via ferramentas próprias, containers ou firmware.
 Não reinicia automaticamente nem retoma operações automaticamente após reboot.
 Pergunta sobre backup externo ou prosseguimento sem ele; /etc não é backup dos dados.
@@ -381,7 +382,7 @@ screen_header() {
  if [[ -t 0 && ${TERM:-dumb} != dumb && -w /dev/tty ]]; then
   printf '\033[2J\033[H' > /dev/tty
  fi
- printf '\nGERBIT — ASSISTENTE DE MANUTENÇÃO v3.3\n%s\n\n' "$1"
+ printf '\nGERBIT — ASSISTENTE DE MANUTENÇÃO v3.4\n%s\n\n' "$1"
 }
 pause_screen() {
  local pause_answer
@@ -397,7 +398,7 @@ interactive_wizard() {
  local session
  session=$(mktemp /var/log/gerbit-assistente-XXXXXXXX.log)
  exec > >(tee -a "$session") 2>&1
- echo 'GERBIT — ASSISTENTE DE MANUTENÇÃO v3.3'
+ echo 'GERBIT — ASSISTENTE DE MANUTENÇÃO v3.4'
  echo "Log da sessão: $session"
  echo 'Cada ação pede confirmação. Enter mantém a opção de cancelar/não.'
  echo 'Depois de um reboot, execute este mesmo arquivo novamente.'
@@ -939,8 +940,189 @@ security_flow() {
  echo "Relatório completo: $run/security.log"
 }
 
-if (($# == 0)) || [[ ${1:-} == --security ]]; then
+debian_upgrade_checkpoint() {
+ local tmp
+ tmp=$(mktemp "$DEB_STATE/.progress-XXXXXXXX")
+ printf '%s\n' "$DEB_RUN" "$DEB_PHASE" "$DEB_BOOT" > "$tmp"
+ chmod 600 "$tmp"
+ mv -f "$tmp" "$DEB_STATE/progress"
+}
+debian11_upgrade() {
+ ((EUID == 0)) || { echo 'Execute com sudo/root'; return 1; }
+ [[ -t 0 ]] || { echo 'Use terminal interativo'; return 1; }
+ local ID VERSION_ID PRETTY_NAME
+ . /etc/os-release
+ [[ $ID == debian && ( $VERSION_ID == 11 || $VERSION_ID == 12 ) ]] || { echo 'Este roteiro é somente Debian11 → Debian12'; return 1; }
+ [[ $(dpkg --print-architecture) == amd64 ]] || { echo 'Migração Debian implementada somente para amd64 neste roteiro.'; return 1; }
+ local panel
+ for panel in /usr/local/cpanel /usr/local/psa /usr/local/directadmin /www/server/panel /etc/pve /etc/proxmox-backup; do
+  [[ ! -e $panel ]] || { echo "Ambiente com procedimento próprio: $panel"; return 1; }
+ done
+ if systemd-detect-virt --container --quiet; then echo 'Migração do host bloqueada em container'; return 1; fi
+ local DEB_STATE=/var/lib/gerbit-suite/debian11-upgrade
+ [[ ! -L /var/lib/gerbit-suite && ! -L $DEB_STATE ]] || return 1
+ install -d -m 700 -o root -g root "$DEB_STATE"
+ exec 8>/run/lock/gerbit-suite.lock
+ flock -n 8 || { echo 'Outra operação da suíte está executando'; return 1; }
+ exec 9>/run/lock/atualizar-php.lock
+ flock -n 9 || { echo 'Outra atualização PHP está executando'; return 1; }
+ local DEB_RUN='' DEB_PHASE=preflight DEB_BOOT=-
+ local -a saved=()
+ if [[ -f $DEB_STATE/progress && ! -L $DEB_STATE/progress ]]; then
+  mapfile -t saved < "$DEB_STATE/progress"
+  if ((${#saved[@]} != 3)) ||
+   [[ ! ${saved[0]} =~ ^/var/backups/gerbit-debian11to12-[A-Za-z0-9]+$ ]] ||
+   [[ ! ${saved[1]} =~ ^(preflight|old-updated|switching|new-sources|minimal|full|reboot|done)$ ]] ||
+   [[ ! ${saved[2]} =~ ^(-|[a-f0-9-]+)$ ]]; then echo 'Progresso inválido; revisão necessária.'; return 1; fi
+  DEB_RUN=${saved[0]}; DEB_PHASE=${saved[1]}; DEB_BOOT=${saved[2]}
+  [[ -d $DEB_RUN && ! -L $DEB_RUN ]] || { echo 'Diretório do checkpoint ausente/inválido'; return 1; }
+  echo "Migração anterior: etapa $DEB_PHASE | arquivos $DEB_RUN"
+  sequence_confirm 'Retomar esta migração?' || return 10
+ elif [[ $VERSION_ID == 12 ]]; then
+  echo 'Já está no Debian12; não há checkpoint deste roteiro para retomar.'; return 0
+ else
+  umask 077
+  DEB_RUN=$(mktemp -d /var/backups/gerbit-debian11to12-XXXXXXXX)
+  debian_upgrade_checkpoint
+ fi
+ exec > >(tee -a "$DEB_RUN/upgrade.log") 2>&1
+ section "MIGRAÇÃO GUIADA — Debian11 → Debian12 — etapa $DEB_PHASE"
+ echo "Backup, planos e log: $DEB_RUN"
+ echo 'Referência: https://www.debian.org/releases/bookworm/amd64/release-notes/ch-upgrading.en.html'
+ local boot_now path reply f id
+ boot_now=$(cat /proc/sys/kernel/random/boot_id)
+ if [[ $DEB_PHASE == reboot ]]; then
+  if [[ $boot_now == "$DEB_BOOT" ]]; then
+   echo 'Reinicialização pendente. Não inicie nova alteração de pacotes.'
+   sequence_confirm 'Reiniciar agora?' && systemctl reboot
+   return 20
+  fi
+  [[ $VERSION_ID == 12 ]] || { echo 'Após reboot o sistema não confirmou Debian12. Revise o log.'; return 1; }
+  [[ -z $(dpkg --audit) ]] || { echo 'Há pendências dpkg; revise antes de continuar.'; return 1; }
+  DEB_PHASE=done; debian_upgrade_checkpoint
+ fi
+ if [[ $DEB_PHASE == done ]]; then
+  echo 'Migração do sistema registrada como concluída.'
+  echo 'Valide TeamPass, banco, rede e SSH. Repositórios terceiros continuam desativados.'
+  echo 'O fluxo de segurança PHP será oferecido novamente; PHP7.4 remanescente não é considerado corrigido.'
+  return 0
+ fi
+ if [[ $DEB_PHASE == switching ]]; then
+  echo 'Houve interrupção durante a troca de fontes. Revise /etc/apt e os backups antes de continuar.'
+  return 1
+ fi
+ if [[ $DEB_PHASE == preflight ]]; then
+  echo 'Esta migração pode alterar PHP, MariaDB, OpenSSL e serviços da aplicação.'
+  echo 'Para TeamPass: valide a versão da aplicação com PHP8.2 e faça backup do banco, arquivos e chaves de criptografia.'
+  echo 'Use console ou tmux/screen; uma desconexão SSH durante o upgrade pode interromper a sessão.'
+  sequence_confirm 'Compatibilidade revisada, janela de manutenção e console de recuperação disponíveis?' || return 10
+  backup_question || return 10
+  [[ -z $(dpkg --audit) ]] || { echo 'dpkg incompleto; corrija antes.'; return 1; }
+  [[ -z $(apt-mark showhold) ]] || { echo 'Pacotes retidos; revisão necessária.'; return 1; }
+  [[ $(df -Pk / | awk 'NR==2{print $4}') -ge 5242880 ]] || { echo 'Exige ao menos 5 GiB livres em /; o APT verificará a necessidade real.'; return 1; }
+  [[ $(df -Pk /boot | awk 'NR==2{print $4}') -ge 262144 ]] || { echo 'Exige ao menos 256 MiB livres em /boot para o novo kernel.'; return 1; }
+  [[ -r /boot/grub/grub.cfg ]] || { echo 'Bootloader fora do roteiro GRUB; migração exige análise própria.'; return 1; }
+  for f in /etc/apt/preferences /etc/apt/preferences.d/*; do
+   [[ ! -f $f ]] || ! grep -qE '^[[:space:]]*(Package|Pin):' "$f" || { echo "Pinning ativo: $f. Revise antes de trocar a release."; return 1; }
+  done
+  tar -C / -czf "$DEB_RUN/config-and-package-db.tar.gz" etc var/lib/dpkg
+  dpkg --get-selections '*' > "$DEB_RUN/selections-before.txt"
+  dpkg-query -W > "$DEB_RUN/packages-before.txt"
+  apt-mark showmanual > "$DEB_RUN/manual-before.txt"
+  [[ ! -f /var/lib/apt/extended_states ]] || cp -a /var/lib/apt/extended_states "$DEB_RUN/extended_states"
+  section 'PREPARAÇÃO — Atualizar a release Debian11 antes de mudar as fontes'
+  if ! apt_refresh; then apt_recover_indexes || return 1; fi
+  apt-get check
+  apt_run --no-remove install debian-archive-keyring gpgv ca-certificates
+  apt-get -s dist-upgrade | tee "$DEB_RUN/bullseye-plan.txt"
+  sequence_confirm 'Aplicar o plano da release atual antes da migração?' || return 10
+  apt_run dist-upgrade
+  apt-get check
+  [[ -z $(dpkg --audit) ]] || return 1
+  DEB_PHASE=old-updated; debian_upgrade_checkpoint
+ fi
+ if [[ $DEB_PHASE == old-updated ]]; then
+  section 'PLANO — Debian12 com repositórios oficiais'
+  cat > "$DEB_RUN/bookworm.list" <<'SOURCES'
+deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
+deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
+deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
+SOURCES
+  local -a preview=(-o "Dir::Etc::sourcelist=$DEB_RUN/bookworm.list" -o Dir::Etc::sourceparts=- -o "Dir::State::lists=$DEB_RUN/preview-lists")
+  install -d -m 755 "$DEB_RUN/preview-lists"
+  apt-get "${preview[@]}" -o APT::Update::Error-Mode=any update
+  apt-get "${preview[@]}" -s dist-upgrade | tee "$DEB_RUN/bookworm-plan.txt"
+  echo 'Os arquivos de fontes atuais serão desativados e preservados. Novas fontes: apenas oficiais do Debian12.'
+  echo 'Repositórios terceiros NÃO serão convertidos nem reativados automaticamente.'
+  echo 'Arquivos afetados:'
+  for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do [[ ! -f $f ]] || printf '%s\n' "$f"; done
+  read -r -p 'Para autorizar a troca de release e desativação das fontes, digite MIGRAR DEBIAN 12: ' reply
+  [[ $reply == 'MIGRAR DEBIAN 12' ]] || return 10
+  DEB_PHASE=switching; debian_upgrade_checkpoint
+  id=${DEB_RUN##*/}
+  for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+   [[ ! -e $f && ! -L $f ]] || mv -- "$f" "$f.$id.disabled"
+  done
+  install -m 644 "$DEB_RUN/bookworm.list" /etc/apt/sources.list
+  # Os índices de Bullseye não podem ser reutilizados na nova release.
+  unset GERBIT_APT_LISTS
+  DEB_PHASE=new-sources; debian_upgrade_checkpoint
+ fi
+ if [[ $DEB_PHASE == new-sources ]]; then
+  apt_refresh
+  section 'EXECUÇÃO — Upgrade mínimo (sem novos pacotes)'
+  sequence_confirm 'Executar o upgrade mínimo para Debian12?' || return 10
+  apt_run --without-new-pkgs upgrade
+  DEB_PHASE=minimal; debian_upgrade_checkpoint
+ fi
+ if [[ $DEB_PHASE == minimal ]]; then
+  section 'EXECUÇÃO — Upgrade completo Debian12'
+  apt-get -s dist-upgrade | tee "$DEB_RUN/full-plan.txt"
+  sequence_confirm 'Executar o upgrade completo conforme o plano exibido?' || return 10
+  apt_run dist-upgrade
+  apt_run --no-remove install linux-image-amd64
+  apt-get check
+  [[ -z $(dpkg --audit) ]] || { echo 'Pendências dpkg; migração ainda não concluída.'; return 1; }
+  . /etc/os-release
+  [[ $VERSION_ID == 12 ]] || { echo 'A release final não foi confirmada como Debian12.'; return 1; }
+  DEB_PHASE=full; debian_upgrade_checkpoint
+ fi
+ if [[ $DEB_PHASE == full ]]; then
+  DEB_BOOT=$(cat /proc/sys/kernel/random/boot_id)
+  DEB_PHASE=reboot; debian_upgrade_checkpoint
+  section 'REINICIALIZAÇÃO — Migração do sistema aplicada; falta validar após reboot'
+  echo 'Após reconectar, execute novamente a suíte. Ela reconhecerá o progresso.'
+  sequence_confirm 'Reiniciar agora?' && systemctl reboot
+  return 20
+ fi
+}
+security_entry() {
+ local ID VERSION_ID
+ . /etc/os-release
+ local self state=/var/lib/gerbit-suite/debian11-upgrade/progress
+ self=$(readlink -f "${BASH_SOURCE[0]}")
+ local previous_phase=''
+ [[ ! -f $state ]] || previous_phase=$(sed -n '2p' "$state")
+ if [[ $ID == debian && ( $VERSION_ID == 11 || ( -f $state && $previous_phase != done ) ) ]]; then
+  section 'PRÓXIMO PASSO — Debian11 sem suporte LTS oficial'
+  echo 'O caminho implementado é Debian11 → Debian12, uma release por vez.'
+  echo 'A auditoria PHP só prossegue após o upgrade e o reboot, se você escolher migrar.'
+  if sequence_confirm 'Abrir a migração Debian11 → Debian12 (ou retomar o progresso salvo)?'; then
+   # Processo separado: libera locks ao encerrar e preserva errexit nas etapas.
+   bash "$self" --debian-upgrade
+   . /etc/os-release
+   [[ $VERSION_ID != 11 ]] || return 1
+  else
+   echo 'Migração não iniciada. Prosseguindo apenas com a auditoria de segurança disponível.'
+  fi
+ fi
  security_flow
+}
+
+if (($# == 0)) || [[ ${1:-} == --security ]]; then
+ security_entry
+elif [[ ${1:-} == --debian-upgrade ]]; then
+ debian11_upgrade
 elif [[ ${1:-} == --sequence ]]; then
  sequence_flow
 elif [[ ${1:-} == --wizard ]]; then
