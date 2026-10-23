@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# Suíte Gerbit v3.4: assistente interativo de manutenção.
+# Suíte Gerbit v3.5: assistente interativo de manutenção.
 set -Eeuo pipefail
 export LC_ALL=C
-# APT com índices isolados quando uma recuperação for necessária.
-# Não desativa assinaturas, validade, certificados nem altera sources.list.
+# APT com perfis temporários de recuperação; fontes persistentes não são alteradas.
 apt-get() {
  local -a options=()
- [[ -z ${GERBIT_APT_LISTS:-} ]] || options=(-o "Dir::State::lists=$GERBIT_APT_LISTS")
+ [[ -z ${GERBIT_APT_LISTS:-} ]] || options+=(-o "Dir::State::lists=$GERBIT_APT_LISTS")
+ [[ -z ${GERBIT_APT_SOURCE:-} ]] || options+=(-o "Dir::Etc::sourcelist=$GERBIT_APT_SOURCE" -o Dir::Etc::sourceparts=-)
  command apt-get "${options[@]}" "$@"
 }
 apt-cache() {
  local -a options=()
- [[ -z ${GERBIT_APT_LISTS:-} ]] || options=(-o "Dir::State::lists=$GERBIT_APT_LISTS")
+ [[ -z ${GERBIT_APT_LISTS:-} ]] || options+=(-o "Dir::State::lists=$GERBIT_APT_LISTS")
+ [[ -z ${GERBIT_APT_SOURCE:-} ]] || options+=(-o "Dir::Etc::sourcelist=$GERBIT_APT_SOURCE" -o Dir::Etc::sourceparts=-)
  command apt-cache "${options[@]}" "$@"
 }
 apt_refresh() {
@@ -31,23 +32,69 @@ apt_recover_indexes() {
  echo "Índices desta execução: $GERBIT_APT_LISTS"
  apt_refresh
 }
+apt_bullseye_archive() {
+ local os_id os_version profile previous_source=${GERBIT_APT_SOURCE:-} previous_lists=${GERBIT_APT_LISTS:-}
+ os_id=$(. /etc/os-release; echo "$ID")
+ os_version=$(. /etc/os-release; echo "$VERSION_ID")
+ [[ $os_id == debian && $os_version == 11 && -z $previous_source ]] || return 1
+ [[ ${GERBIT_ALLOW_BULLSEYE_ARCHIVE:-1} != 0 ]] || { echo 'Fallback Bullseye bloqueado durante a migração para Bookworm.'; return 1; }
+ if grep -RqsE '^[[:space:]]*(deb[[:space:]].*bookworm|Suites:[[:space:]].*bookworm)' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
+  echo 'Fontes Bookworm detectadas: não será usado arquivo Bullseye para evitar mistura de releases.'; return 1
+ fi
+ echo 'O mirror atual não forneceu os arquivos. Existe um arquivo oficial para Bullseye.'
+ echo 'Será usado archive.debian.org somente nesta execução, com índices separados.'
+ echo 'Repositórios terceiros não serão usados nesta tentativa. /etc/apt não será modificado.'
+ echo 'Pacotes arquivados NÃO são novas correções de segurança; servem para preparar a migração.'
+ sequence_confirm 'Tentar o arquivo oficial assinado do Debian11?' || return 1
+ [[ -r /usr/share/keyrings/debian-archive-keyring.gpg ]] || { echo 'Chave oficial Debian ausente; operação bloqueada.'; return 1; }
+ umask 077
+ profile=$(mktemp -d /var/backups/gerbit-bullseye-archive-XXXXXXXX)
+ cat > "$profile/sources.list" <<'ARCHIVE'
+deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://archive.debian.org/debian bullseye main contrib non-free
+deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://archive.debian.org/debian-security bullseye-security main contrib non-free
+ARCHIVE
+ GERBIT_APT_SOURCE="$profile/sources.list"
+ GERBIT_APT_LISTS=$(mktemp -d /var/lib/apt/gerbit-lists-XXXXXXXX)
+ chmod 755 "$GERBIT_APT_LISTS"
+ install -d -m 700 "$GERBIT_APT_LISTS/partial"
+ echo "Perfil temporário: $GERBIT_APT_SOURCE"
+ # Sem trusted=yes, sem --allow-unauthenticated, sem desligar validade/TLS.
+ if apt_refresh; then
+  echo 'Índices do arquivo oficial validados pelo APT. Confira o novo plano antes de instalar.'
+  return 0
+ fi
+ GERBIT_APT_SOURCE=$previous_source; GERBIT_APT_LISTS=$previous_lists
+ echo 'Arquivo oficial não pôde ser validado. Não prosseguiremos com índices não autenticados.'
+ return 1
+}
+apt_prepare() {
+ if apt_refresh; then return 0; fi
+ if apt_recover_indexes; then return 0; fi
+ apt_bullseye_archive
+}
 apt_run() {
- local log rc
+ local log rc retry_log
  log=$(mktemp /var/tmp/gerbit-apt-error-XXXXXXXX.log)
  chmod 600 "$log"
  if apt-get "$@" 2>&1 | tee "$log"; then rm -f "$log"; return 0; else rc=$?; fi
- if grep -Eq '404|Failed to fetch|Unable to fetch some archives' "$log"; then
-  echo "Falha de download do APT. Detalhes: $log"
-  if apt_recover_indexes; then
-   echo 'Índices recarregados. O APT calculará novamente os candidatos e o plano.'
-   echo 'A nova tentativa será única; confira os pacotes antes de confirmar.'
-   apt-get "$@"
-   return $?
+ if ! grep -Eq '404|Failed to fetch|Unable to fetch some archives' "$log"; then
+  echo "Erro não relacionado a download. Sem repetição automática. Log: $log"; return "$rc"
+ fi
+ echo "Falha de download APT. Detalhes: $log"
+ if apt_recover_indexes; then
+  retry_log="$log.retry"
+  echo 'Nova tentativa com índices recarregados; o APT recalculará o plano.'
+  if apt-get "$@" 2>&1 | tee "$retry_log"; then return 0; else rc=$?; fi
+  if ! grep -Eq '404|Failed to fetch|Unable to fetch some archives' "$retry_log"; then
+   echo "A tentativa falhou por outro motivo. Sem troca de repositório. Log: $retry_log"; return "$rc"
   fi
  fi
- echo 'Operação interrompida; não foram ignorados erros de repositório ou autenticação.'
- echo "Confira $log, data/hora, acesso à rede, proxy/cache e disponibilidade do repositório."
- echo 'Repositórios encerrados/arquivados exigem revisão; não são convertidos automaticamente.'
+ if apt_bullseye_archive; then
+  echo 'Tentativa final com o arquivo oficial. Revise versões, remoções e tamanho do download.'
+  if apt-get "$@"; then return 0; else rc=$?; fi
+ fi
+ echo "Operação interrompida. Logs: $log e possíveis arquivos .retry."
+ echo 'O processo não ignora assinaturas, certificados ou metadados vencidos.'
  return "$rc"
 }
 apt_eol_notice() {
@@ -165,7 +212,7 @@ HELP
  lsblk -f > "$run/storage-before.txt"
  local -a apt=(apt-get -o APT::Update::Error-Mode=any)
  section 'ETAPA — Atualização dos índices dos repositórios'
- apt_refresh
+ apt_prepare
  "${apt[@]}" check
  # Sem -y: o operador revisa remoções e responde perguntas de configuração.
  section 'ETAPA — Simulação da atualização de pacotes'
@@ -382,7 +429,7 @@ screen_header() {
  if [[ -t 0 && ${TERM:-dumb} != dumb && -w /dev/tty ]]; then
   printf '\033[2J\033[H' > /dev/tty
  fi
- printf '\nGERBIT — ASSISTENTE DE MANUTENÇÃO v3.4\n%s\n\n' "$1"
+ printf '\nGERBIT — ASSISTENTE DE MANUTENÇÃO v3.5\n%s\n\n' "$1"
 }
 pause_screen() {
  local pause_answer
@@ -398,7 +445,7 @@ interactive_wizard() {
  local session
  session=$(mktemp /var/log/gerbit-assistente-XXXXXXXX.log)
  exec > >(tee -a "$session") 2>&1
- echo 'GERBIT — ASSISTENTE DE MANUTENÇÃO v3.4'
+ echo 'GERBIT — ASSISTENTE DE MANUTENÇÃO v3.5'
  echo "Log da sessão: $session"
  echo 'Cada ação pede confirmação. Enter mantém a opção de cancelar/não.'
  echo 'Depois de um reboot, execute este mesmo arquivo novamente.'
@@ -841,7 +888,7 @@ security_flow() {
  echo 'Em 23/10, PHP também orientou session.upload_progress.enabled=0 para CVE-2026-115560.'
  echo 'Esta etapa oferecerá aplicar essa configuração com backup e reiniciar os serviços identificados.'
  sequence_confirm 'Atualizar os índices APT e procurar pacotes corrigidos nas linhas atuais?' || return 0
- apt_refresh
+ apt_prepare
  apt-get check
  [[ -z $(dpkg --audit) ]] || { echo 'dpkg incompleto. Use --repair antes de tentar novamente.'; return 1; }
  local p n line candidate q name active_config unresolved_candidates=0
@@ -985,6 +1032,7 @@ debian11_upgrade() {
   DEB_RUN=$(mktemp -d /var/backups/gerbit-debian11to12-XXXXXXXX)
   debian_upgrade_checkpoint
  fi
+ case "$DEB_PHASE" in new-sources|minimal|full|reboot|done) GERBIT_ALLOW_BULLSEYE_ARCHIVE=0;; esac
  exec > >(tee -a "$DEB_RUN/upgrade.log") 2>&1
  section "MIGRAÇÃO GUIADA — Debian11 → Debian12 — etapa $DEB_PHASE"
  echo "Backup, planos e log: $DEB_RUN"
@@ -1031,7 +1079,7 @@ debian11_upgrade() {
   apt-mark showmanual > "$DEB_RUN/manual-before.txt"
   [[ ! -f /var/lib/apt/extended_states ]] || cp -a /var/lib/apt/extended_states "$DEB_RUN/extended_states"
   section 'PREPARAÇÃO — Atualizar a release Debian11 antes de mudar as fontes'
-  if ! apt_refresh; then apt_recover_indexes || return 1; fi
+  apt_prepare
   apt-get check
   apt_run --no-remove install debian-archive-keyring gpgv ca-certificates
   apt-get -s dist-upgrade | tee "$DEB_RUN/bullseye-plan.txt"
@@ -1065,11 +1113,12 @@ SOURCES
   done
   install -m 644 "$DEB_RUN/bookworm.list" /etc/apt/sources.list
   # Os índices de Bullseye não podem ser reutilizados na nova release.
-  unset GERBIT_APT_LISTS
+  unset GERBIT_APT_LISTS GERBIT_APT_SOURCE
+  GERBIT_ALLOW_BULLSEYE_ARCHIVE=0
   DEB_PHASE=new-sources; debian_upgrade_checkpoint
  fi
  if [[ $DEB_PHASE == new-sources ]]; then
-  apt_refresh
+  apt_prepare
   section 'EXECUÇÃO — Upgrade mínimo (sem novos pacotes)'
   sequence_confirm 'Executar o upgrade mínimo para Debian12?' || return 10
   apt_run --without-new-pkgs upgrade
@@ -1113,7 +1162,9 @@ security_entry() {
    . /etc/os-release
    [[ $VERSION_ID != 11 ]] || return 1
   else
-   echo 'Migração não iniciada. Prosseguindo apenas com a auditoria de segurança disponível.'
+   case "$previous_phase" in switching|new-sources|minimal|full|reboot)
+    echo 'Migração em andamento. Retome o checkpoint antes de executar outra atualização.'; return 10;; esac
+   echo 'Migração não iniciada. Prosseguindo apenas com a auditoria de segurança disponível.' 
   fi
  fi
  security_flow
